@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2021 Tulir Asokan
+// Copyright (C) 2022 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -18,6 +18,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +35,8 @@ import (
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/bridge"
+	"maunium.net/go/mautrix/bridge/bridgeconfig"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
@@ -53,57 +58,89 @@ type User struct {
 	Client  *whatsmeow.Client
 	Session *store.Device
 
-	bridge *Bridge
+	bridge *WABridge
 	log    log.Logger
 
 	Admin            bool
 	Whitelisted      bool
 	RelayWhitelisted bool
+	PermissionLevel  bridgeconfig.PermissionLevel
 
 	mgmtCreateLock  sync.Mutex
 	spaceCreateLock sync.Mutex
 	connLock        sync.Mutex
 
-	historySyncs     chan *events.HistorySync
-	prevBridgeStatus *BridgeState
-	lastPresence     types.Presence
+	historySyncs chan *events.HistorySync
+	lastPresence types.Presence
 
+	historySyncLoopsStarted bool
 	spaceMembershipChecked  bool
 	lastPhoneOfflineWarning time.Time
+
+	groupListCache     []*types.GroupInfo
+	groupListCacheLock sync.Mutex
+	groupListCacheTime time.Time
+
+	BackfillQueue *BackfillQueue
+	BridgeState   *bridge.BridgeStateQueue
 }
 
-func (bridge *Bridge) getUserByMXID(userID id.UserID, onlyIfExists bool) *User {
-	_, isPuppet := bridge.ParsePuppetMXID(userID)
-	if isPuppet || userID == bridge.Bot.UserID {
+func (br *WABridge) getUserByMXID(userID id.UserID, onlyIfExists bool) *User {
+	_, isPuppet := br.ParsePuppetMXID(userID)
+	if isPuppet || userID == br.Bot.UserID {
 		return nil
 	}
-	bridge.usersLock.Lock()
-	defer bridge.usersLock.Unlock()
-	user, ok := bridge.usersByMXID[userID]
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+	user, ok := br.usersByMXID[userID]
 	if !ok {
 		userIDPtr := &userID
 		if onlyIfExists {
 			userIDPtr = nil
 		}
-		return bridge.loadDBUser(bridge.DB.User.GetByMXID(userID), userIDPtr)
+		return br.loadDBUser(br.DB.User.GetByMXID(userID), userIDPtr)
 	}
 	return user
 }
 
-func (bridge *Bridge) GetUserByMXID(userID id.UserID) *User {
-	return bridge.getUserByMXID(userID, false)
+func (br *WABridge) GetUserByMXID(userID id.UserID) *User {
+	return br.getUserByMXID(userID, false)
 }
 
-func (bridge *Bridge) GetUserByMXIDIfExists(userID id.UserID) *User {
-	return bridge.getUserByMXID(userID, true)
+func (br *WABridge) GetIUser(userID id.UserID, create bool) bridge.User {
+	u := br.getUserByMXID(userID, !create)
+	if u == nil {
+		return nil
+	}
+	return u
 }
 
-func (bridge *Bridge) GetUserByJID(jid types.JID) *User {
-	bridge.usersLock.Lock()
-	defer bridge.usersLock.Unlock()
-	user, ok := bridge.usersByUsername[jid.User]
+func (user *User) GetPermissionLevel() bridgeconfig.PermissionLevel {
+	return user.PermissionLevel
+}
+
+func (user *User) GetManagementRoomID() id.RoomID {
+	return user.ManagementRoom
+}
+
+func (user *User) GetMXID() id.UserID {
+	return user.MXID
+}
+
+func (user *User) GetCommandState() map[string]interface{} {
+	return nil
+}
+
+func (br *WABridge) GetUserByMXIDIfExists(userID id.UserID) *User {
+	return br.getUserByMXID(userID, true)
+}
+
+func (br *WABridge) GetUserByJID(jid types.JID) *User {
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+	user, ok := br.usersByUsername[jid.User]
 	if !ok {
-		return bridge.loadDBUser(bridge.DB.User.GetByUsername(jid.User), nil)
+		return br.loadDBUser(br.DB.User.GetByUsername(jid.User), nil)
 	}
 	return user
 }
@@ -114,7 +151,7 @@ func (user *User) addToJIDMap() {
 	user.bridge.usersLock.Unlock()
 }
 
-func (user *User) removeFromJIDMap(state BridgeStateEvent) {
+func (user *User) removeFromJIDMap(state bridge.State) {
 	user.bridge.usersLock.Lock()
 	jidUser, ok := user.bridge.usersByUsername[user.JID.User]
 	if ok && user == jidUser {
@@ -122,38 +159,38 @@ func (user *User) removeFromJIDMap(state BridgeStateEvent) {
 	}
 	user.bridge.usersLock.Unlock()
 	user.bridge.Metrics.TrackLoginState(user.JID, false)
-	user.sendBridgeState(BridgeState{StateEvent: state})
+	user.BridgeState.Send(state)
 }
 
-func (bridge *Bridge) GetAllUsers() []*User {
-	bridge.usersLock.Lock()
-	defer bridge.usersLock.Unlock()
-	dbUsers := bridge.DB.User.GetAll()
+func (br *WABridge) GetAllUsers() []*User {
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+	dbUsers := br.DB.User.GetAll()
 	output := make([]*User, len(dbUsers))
 	for index, dbUser := range dbUsers {
-		user, ok := bridge.usersByMXID[dbUser.MXID]
+		user, ok := br.usersByMXID[dbUser.MXID]
 		if !ok {
-			user = bridge.loadDBUser(dbUser, nil)
+			user = br.loadDBUser(dbUser, nil)
 		}
 		output[index] = user
 	}
 	return output
 }
 
-func (bridge *Bridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
+func (br *WABridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
 	if dbUser == nil {
 		if mxid == nil {
 			return nil
 		}
-		dbUser = bridge.DB.User.New()
+		dbUser = br.DB.User.New()
 		dbUser.MXID = *mxid
 		dbUser.Insert()
 	}
-	user := bridge.NewUser(dbUser)
-	bridge.usersByMXID[user.MXID] = user
+	user := br.NewUser(dbUser)
+	br.usersByMXID[user.MXID] = user
 	if !user.JID.IsEmpty() {
 		var err error
-		user.Session, err = bridge.WAContainer.GetDevice(user.JID)
+		user.Session, err = br.WAContainer.GetDevice(user.JID)
 		if err != nil {
 			user.log.Errorfln("Failed to load user's whatsapp session: %v", err)
 		} else if user.Session == nil {
@@ -161,28 +198,31 @@ func (bridge *Bridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
 			user.JID = types.EmptyJID
 			user.Update()
 		} else {
-			bridge.usersByUsername[user.JID.User] = user
+			user.Session.Log = &waLogger{user.log.Sub("Session")}
+			br.usersByUsername[user.JID.User] = user
 		}
 	}
 	if len(user.ManagementRoom) > 0 {
-		bridge.managementRooms[user.ManagementRoom] = user
+		br.managementRooms[user.ManagementRoom] = user
 	}
 	return user
 }
 
-func (bridge *Bridge) NewUser(dbUser *database.User) *User {
+func (br *WABridge) NewUser(dbUser *database.User) *User {
 	user := &User{
 		User:   dbUser,
-		bridge: bridge,
-		log:    bridge.Log.Sub("User").Sub(string(dbUser.MXID)),
+		bridge: br,
+		log:    br.Log.Sub("User").Sub(string(dbUser.MXID)),
 
 		historySyncs: make(chan *events.HistorySync, 32),
 		lastPresence: types.PresenceUnavailable,
 	}
-	user.RelayWhitelisted = user.bridge.Config.Bridge.Permissions.IsRelayWhitelisted(user.MXID)
-	user.Whitelisted = user.bridge.Config.Bridge.Permissions.IsWhitelisted(user.MXID)
-	user.Admin = user.bridge.Config.Bridge.Permissions.IsAdmin(user.MXID)
-	go user.handleHistorySyncsLoop()
+
+	user.PermissionLevel = user.bridge.Config.Bridge.Permissions.Get(user.MXID)
+	user.RelayWhitelisted = user.PermissionLevel >= bridgeconfig.PermissionLevelRelay
+	user.Whitelisted = user.PermissionLevel >= bridgeconfig.PermissionLevelUser
+	user.Admin = user.PermissionLevel >= bridgeconfig.PermissionLevelAdmin
+	user.BridgeState = br.NewBridgeStateQueue(user, user.log)
 	return user
 }
 
@@ -319,14 +359,30 @@ func (w *waLogger) Sub(module string) waLog.Logger         { return &waLogger{l:
 
 var ErrAlreadyLoggedIn = errors.New("already logged in")
 
+func (user *User) obfuscateJID(jid types.JID) string {
+	// Turn the first 4 bytes of HMAC-SHA256(hs_token, phone) into a number and replace the middle of the actual phone with that deterministic random number.
+	randomNumber := binary.BigEndian.Uint32(hmac.New(sha256.New, []byte(user.bridge.Config.AppService.HSToken)).Sum([]byte(jid.User))[:4])
+	return fmt.Sprintf("+%s-%d-%s:%d", jid.User[:1], randomNumber, jid.User[len(jid.User)-2:], jid.Device)
+}
+
 func (user *User) createClient(sess *store.Device) {
 	user.Client = whatsmeow.NewClient(sess, &waLogger{user.log.Sub("Client")})
 	user.Client.AddEventHandler(user.HandleEvent)
-	user.Client.GetMessageForRetry = func(to types.JID, id types.MessageID) *waProto.Message {
+	user.Client.SetForceActiveDeliveryReceipts(user.bridge.Config.Bridge.ForceActiveDeliveryReceipts)
+	user.Client.GetMessageForRetry = func(requester, to types.JID, id types.MessageID) *waProto.Message {
+		Segment.Track(user.MXID, "WhatsApp incoming retry (message not found)", map[string]interface{}{
+			"requester": user.obfuscateJID(requester),
+			"messageID": id,
+		})
 		user.bridge.Metrics.TrackRetryReceipt(0, false)
 		return nil
 	}
-	user.Client.PreRetryCallback = func(receipt *events.Receipt, retryCount int, msg *waProto.Message) bool {
+	user.Client.PreRetryCallback = func(receipt *events.Receipt, messageID types.MessageID, retryCount int, msg *waProto.Message) bool {
+		Segment.Track(user.MXID, "WhatsApp incoming retry (accepted)", map[string]interface{}{
+			"requester":  user.obfuscateJID(receipt.Sender),
+			"messageID":  messageID,
+			"retryCount": retryCount,
+		})
 		user.bridge.Metrics.TrackRetryReceipt(retryCount, true)
 		return true
 	}
@@ -363,11 +419,18 @@ func (user *User) Connect() bool {
 		return false
 	}
 	user.log.Debugln("Connecting to WhatsApp")
-	user.sendBridgeState(BridgeState{StateEvent: StateConnecting, Error: WAConnecting})
+	user.BridgeState.Send(bridge.State{StateEvent: bridge.StateConnecting, Error: WAConnecting})
 	user.createClient(user.Session)
 	err := user.Client.Connect()
 	if err != nil {
 		user.log.Warnln("Error connecting to WhatsApp:", err)
+		user.BridgeState.Send(bridge.State{
+			StateEvent: bridge.StateUnknownError,
+			Error:      WAConnectionFailed,
+			Info: map[string]interface{}{
+				"go_error": err.Error(),
+			},
+		})
 		return false
 	}
 	return true
@@ -405,6 +468,12 @@ func (user *User) DeleteSession() {
 		user.JID = types.EmptyJID
 		user.Update()
 	}
+
+	// Delete all of the backfill and history sync data.
+	user.bridge.DB.Backfill.DeleteAll(user.MXID)
+	user.bridge.DB.HistorySync.DeleteAllConversations(user.MXID)
+	user.bridge.DB.HistorySync.DeleteAllMessages(user.MXID)
+	user.bridge.DB.MediaBackfillRequest.DeleteAllMediaBackfillRequests(user.MXID)
 }
 
 func (user *User) IsConnected() bool {
@@ -475,8 +544,43 @@ func (user *User) handleCallStart(sender types.JID, id, callType string, ts time
 }
 
 const PhoneDisconnectWarningTime = 12 * 24 * time.Hour // 12 days
+const PhoneDisconnectPingTime = 10 * 24 * time.Hour
+const PhoneMinPingInterval = 24 * time.Hour
 
-func (user *User) PhoneRecentlySeen() bool {
+func (user *User) sendHackyPhonePing() {
+	user.PhoneLastPinged = time.Now()
+	msgID := whatsmeow.GenerateMessageID()
+	keyIDs := make([]*waProto.AppStateSyncKeyId, 0, 1)
+	lastKeyID, err := user.GetLastAppStateKeyID()
+	if lastKeyID != nil {
+		keyIDs = append(keyIDs, &waProto.AppStateSyncKeyId{
+			KeyId: lastKeyID,
+		})
+	} else {
+		user.log.Warnfln("Failed to get last app state key ID to send hacky phone ping: %v - sending empty request", err)
+	}
+	ts, err := user.Client.SendMessage(user.JID.ToNonAD(), msgID, &waProto.Message{
+		ProtocolMessage: &waProto.ProtocolMessage{
+			Type: waProto.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST.Enum(),
+			AppStateSyncKeyRequest: &waProto.AppStateSyncKeyRequest{
+				KeyIds: keyIDs,
+			},
+		},
+	})
+	if err != nil {
+		user.log.Warnfln("Failed to send hacky phone ping: %v", err)
+	} else {
+		user.log.Debugfln("Sent hacky phone ping %s/%s because phone has been offline for >10 days", msgID, ts.Unix())
+		user.PhoneLastPinged = ts
+		user.Update()
+	}
+}
+
+func (user *User) PhoneRecentlySeen(doPing bool) bool {
+	if doPing && !user.PhoneLastSeen.IsZero() && user.PhoneLastSeen.Add(PhoneDisconnectPingTime).Before(time.Now()) && user.PhoneLastPinged.Add(PhoneMinPingInterval).Before(time.Now()) {
+		// Over 10 days since the phone was seen and over a day since the last somewhat hacky ping, send a new ping.
+		go user.sendHackyPhonePing()
+	}
 	return user.PhoneLastSeen.IsZero() || user.PhoneLastSeen.Add(PhoneDisconnectWarningTime).After(time.Now())
 }
 
@@ -487,9 +591,13 @@ func (user *User) phoneSeen(ts time.Time) {
 		// The last seen timestamp isn't going to be perfectly accurate in any case,
 		// so don't spam the database with an update every time there's an event.
 		return
-	} else if !user.PhoneRecentlySeen() && user.GetPrevBridgeState().Error == WAPhoneOffline && user.IsConnected() {
-		user.log.Debugfln("Saw phone after current bridge state said it has been offline, switching state back to connected")
-		go user.sendBridgeState(BridgeState{StateEvent: StateConnected})
+	} else if !user.PhoneRecentlySeen(false) {
+		if user.BridgeState.GetPrev().Error == WAPhoneOffline && user.IsConnected() {
+			user.log.Debugfln("Saw phone after current bridge state said it has been offline, switching state back to connected")
+			go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateConnected})
+		} else {
+			user.log.Debugfln("Saw phone after current bridge state said it has been offline, not sending new bridge state (prev: %s, connected: %t)", user.BridgeState.GetPrev().Error, user.IsConnected())
+		}
 	}
 	user.PhoneLastSeen = ts
 	go user.Update()
@@ -520,11 +628,8 @@ func (user *User) sendPhoneOfflineWarning() {
 func (user *User) HandleEvent(event interface{}) {
 	switch v := event.(type) {
 	case *events.LoggedOut:
-		go user.handleLoggedOut(v.OnConnect)
-		user.bridge.Metrics.TrackConnectionState(user.JID, false)
-		user.bridge.Metrics.TrackLoginState(user.JID, false)
+		go user.handleLoggedOut(v.OnConnect, v.Reason)
 	case *events.Connected:
-		go user.sendBridgeState(BridgeState{StateEvent: StateConnected})
 		user.bridge.Metrics.TrackConnectionState(user.JID, true)
 		user.bridge.Metrics.TrackLoginState(user.JID, true)
 		if len(user.Client.Store.PushName) > 0 {
@@ -536,19 +641,26 @@ func (user *User) HandleEvent(event interface{}) {
 			}()
 		}
 		go user.tryAutomaticDoublePuppeting()
+
+		if user.bridge.Config.Bridge.HistorySync.Backfill && !user.historySyncLoopsStarted {
+			go user.handleHistorySyncsLoop()
+			user.historySyncLoopsStarted = true
+		}
 	case *events.OfflineSyncPreview:
 		user.log.Infofln("Server says it's going to send %d messages and %d receipts that were missed during downtime", v.Messages, v.Receipts)
-		go user.sendBridgeState(BridgeState{
-			StateEvent: StateBackfilling,
+		go user.BridgeState.Send(bridge.State{
+			StateEvent: bridge.StateBackfilling,
 			Message:    fmt.Sprintf("backfilling %d messages and %d receipts", v.Messages, v.Receipts),
 		})
 	case *events.OfflineSyncCompleted:
-		if !user.PhoneRecentlySeen() {
+		if !user.PhoneRecentlySeen(true) {
 			user.log.Infofln("Offline sync completed, but phone last seen date is still %s - sending phone offline bridge status", user.PhoneLastSeen)
-			go user.sendBridgeState(BridgeState{StateEvent: StateTransientDisconnect, Error: WAPhoneOffline})
-		} else if user.GetPrevBridgeState().StateEvent == StateBackfilling {
-			user.log.Infoln("Offline sync completed")
-			go user.sendBridgeState(BridgeState{StateEvent: StateConnected})
+			go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateTransientDisconnect, Error: WAPhoneOffline})
+		} else {
+			if user.BridgeState.GetPrev().StateEvent == bridge.StateBackfilling {
+				user.log.Infoln("Offline sync completed")
+			}
+			go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateConnected})
 		}
 	case *events.AppStateSyncComplete:
 		if len(user.Client.Store.PushName) > 0 && v.Name == appstate.WAPatchCriticalBlock {
@@ -577,19 +689,43 @@ func (user *User) HandleEvent(event interface{}) {
 		user.JID = v.ID
 		user.addToJIDMap()
 		user.Update()
-	case *events.ConnectFailure, *events.StreamError:
-		go user.sendBridgeState(BridgeState{StateEvent: StateUnknownError})
+	case *events.StreamError:
+		var message string
+		if v.Code != "" {
+			message = fmt.Sprintf("Unknown stream error with code %s", v.Code)
+		} else if children := v.Raw.GetChildren(); len(children) > 0 {
+			message = fmt.Sprintf("Unknown stream error (contains %s node)", children[0].Tag)
+		} else {
+			message = "Unknown stream error"
+		}
+		go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateUnknownError, Message: message})
+		user.bridge.Metrics.TrackConnectionState(user.JID, false)
+	case *events.ConnectFailure:
+		go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateUnknownError, Message: fmt.Sprintf("Unknown connection failure: %s", v.Reason)})
+		user.bridge.Metrics.TrackConnectionState(user.JID, false)
+	case *events.ClientOutdated:
+		user.log.Errorfln("Got a client outdated connect failure. The bridge is likely out of date, please update immediately.")
+		go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateUnknownError, Message: "Connect failure: 405 client outdated"})
+		user.bridge.Metrics.TrackConnectionState(user.JID, false)
+	case *events.TemporaryBan:
+		go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateBadCredentials, Message: v.String()})
 		user.bridge.Metrics.TrackConnectionState(user.JID, false)
 	case *events.Disconnected:
-		go user.sendBridgeState(BridgeState{StateEvent: StateTransientDisconnect})
+		// Don't send the normal transient disconnect state if we're already in a different transient disconnect state.
+		// TODO remove this if/when the phone offline state is moved to a sub-state of CONNECTED
+		if user.BridgeState.GetPrev().Error != WAPhoneOffline && user.PhoneRecentlySeen(false) {
+			go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateTransientDisconnect, Message: "Disconnected from WhatsApp. Trying to reconnect."})
+		}
 		user.bridge.Metrics.TrackConnectionState(user.JID, false)
 	case *events.Contact:
 		go user.syncPuppet(v.JID, "contact event")
 	case *events.PushName:
 		go user.syncPuppet(v.JID, "push name event")
 	case *events.GroupInfo:
+		user.groupListCache = nil
 		go user.handleGroupUpdate(v)
 	case *events.JoinedGroup:
+		user.groupListCache = nil
 		go user.handleGroupCreate(v)
 	case *events.Picture:
 		go user.handlePictureUpdate(v)
@@ -636,7 +772,9 @@ func (user *User) HandleEvent(event interface{}) {
 		portal := user.GetPortalByMessageSource(v.Info.MessageSource)
 		portal.messages <- PortalMessage{undecryptable: v, source: user}
 	case *events.HistorySync:
-		user.historySyncs <- v
+		if user.bridge.Config.Bridge.HistorySync.Backfill {
+			user.historySyncs <- v
+		}
 	case *events.Mute:
 		portal := user.GetPortalByJID(v.JID)
 		if portal != nil {
@@ -658,6 +796,15 @@ func (user *User) HandleEvent(event interface{}) {
 		}
 	case *events.AppState:
 		// Ignore
+	case *events.KeepAliveTimeout:
+		go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateTransientDisconnect, Error: WAKeepaliveTimeout})
+	case *events.KeepAliveRestored:
+		user.log.Infof("Keepalive restored after timeouts, sending connected event")
+		go user.BridgeState.Send(bridge.State{StateEvent: bridge.StateConnected})
+	case *events.MarkChatAsRead:
+		if user.bridge.Config.Bridge.SyncManualMarkedUnread {
+			user.markUnread(user.GetPortalByJID(v.JID), !v.Action.GetRead())
+		}
 	default:
 		user.log.Debugfln("Unknown type of event in HandleEvent: %T", v)
 	}
@@ -754,9 +901,13 @@ func (user *User) syncChatDoublePuppetDetails(portal *Portal, justCreated bool) 
 			return
 		}
 		intent := doublePuppet.CustomIntent()
-		if portal.Key.JID == types.StatusBroadcastJID && justCreated && user.bridge.Config.Bridge.MuteStatusBroadcast {
-			user.updateChatMute(intent, portal, time.Now().Add(365*24*time.Hour))
-			user.updateChatTag(intent, portal, user.bridge.Config.Bridge.ArchiveTag, true)
+		if portal.Key.JID == types.StatusBroadcastJID && justCreated {
+			if user.bridge.Config.Bridge.MuteStatusBroadcast {
+				user.updateChatMute(intent, portal, time.Now().Add(365*24*time.Hour))
+			}
+			if len(user.bridge.Config.Bridge.StatusBroadcastTag) > 0 {
+				user.updateChatTag(intent, portal, user.bridge.Config.Bridge.StatusBroadcastTag, true)
+			}
 			return
 		} else if !chat.Found {
 			return
@@ -795,7 +946,7 @@ func (user *User) UpdateDirectChats(chats map[id.UserID][]id.RoomID) {
 	user.log.Debugln("Updating m.direct list on homeserver")
 	var err error
 	if user.bridge.Config.Homeserver.Asmux {
-		urlPath := intent.BuildBaseURL("_matrix", "client", "unstable", "com.beeper.asmux", "dms")
+		urlPath := intent.BuildClientURL("unstable", "com.beeper.asmux", "dms")
 		_, err = intent.MakeFullRequest(mautrix.FullRequest{
 			Method:      method,
 			URL:         urlPath,
@@ -825,12 +976,20 @@ func (user *User) UpdateDirectChats(chats map[id.UserID][]id.RoomID) {
 	}
 }
 
-func (user *User) handleLoggedOut(onConnect bool) {
-	user.sendBridgeState(BridgeState{StateEvent: StateBadCredentials, Error: WALoggedOut})
+func (user *User) handleLoggedOut(onConnect bool, reason events.ConnectFailureReason) {
+	errorCode := WAUnknownLogout
+	if reason == events.ConnectFailureLoggedOut {
+		errorCode = WALoggedOut
+	} else if reason == events.ConnectFailureMainDeviceGone {
+		errorCode = WAMainDeviceGone
+	}
+	user.removeFromJIDMap(bridge.State{StateEvent: bridge.StateBadCredentials, Error: errorCode})
+	user.DeleteConnection()
+	user.Session = nil
 	user.JID = types.EmptyJID
 	user.Update()
 	if onConnect {
-		user.sendMarkdownBridgeAlert("Connecting to WhatsApp failed as the device was logged out. Please link the bridge to your phone again.")
+		user.sendMarkdownBridgeAlert("Connecting to WhatsApp failed as the device was unlinked (error %s). Please link the bridge to your phone again.", reason)
 	} else {
 		user.sendMarkdownBridgeAlert("You were logged out from another device. Please link the bridge to your phone again.")
 	}
@@ -856,7 +1015,7 @@ func (user *User) GetPortalByJID(jid types.JID) *Portal {
 }
 
 func (user *User) syncPuppet(jid types.JID, reason string) {
-	user.bridge.GetPuppetByJID(jid).SyncContact(user, false, reason)
+	user.bridge.GetPuppetByJID(jid).SyncContact(user, false, false, reason)
 }
 
 func (user *User) ResyncContacts() error {
@@ -867,7 +1026,11 @@ func (user *User) ResyncContacts() error {
 	user.log.Infofln("Resyncing displaynames with %d contacts", len(contacts))
 	for jid, contact := range contacts {
 		puppet := user.bridge.GetPuppetByJID(jid)
-		puppet.Sync(user, contact)
+		if puppet != nil {
+			puppet.Sync(user, contact)
+		} else {
+			user.log.Warnfln("Got a nil puppet for %s while syncing contacts", jid)
+		}
 	}
 	return nil
 }
@@ -881,7 +1044,7 @@ func (user *User) ResyncGroups(createPortals bool) error {
 		portal := user.GetPortalByJID(group.JID)
 		if len(portal.MXID) == 0 {
 			if createPortals {
-				err = portal.CreateMatrixRoom(user, group, true)
+				err = portal.CreateMatrixRoom(user, group, true, true)
 				if err != nil {
 					return fmt.Errorf("failed to create room for %s: %w", group.JID, err)
 				}
@@ -925,7 +1088,7 @@ func (user *User) handleReceipt(receipt *events.Receipt) {
 	if portal == nil || len(portal.MXID) == 0 {
 		return
 	}
-	portal.receipts <- PortalReceipt{evt: receipt, source: user}
+	portal.messages <- PortalMessage{receipt: receipt, source: user}
 }
 
 func makeReadMarkerContent(eventID id.EventID, doublePuppet bool) CustomReadMarkers {
@@ -961,10 +1124,33 @@ func (user *User) markSelfReadFull(portal *Portal) {
 	}
 }
 
+func (user *User) markUnread(portal *Portal, unread bool) {
+	puppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
+	if puppet == nil || puppet.CustomIntent() == nil {
+		return
+	}
+
+	err := puppet.CustomIntent().SetRoomAccountData(portal.MXID, "m.marked_unread",
+		map[string]bool{"unread": unread})
+	if err != nil {
+		user.log.Warnfln("Failed to mark %s as unread via m.marked_unread: %v", portal.MXID, err)
+	} else {
+		user.log.Debugfln("Marked %s as unread via m.marked_unread: %v", portal.MXID, err)
+	}
+
+	err = puppet.CustomIntent().SetRoomAccountData(portal.MXID, "com.famedly.marked_unread",
+		map[string]bool{"unread": unread})
+	if err != nil {
+		user.log.Warnfln("Failed to mark %s as unread via com.famedly.marked_unread: %v", portal.MXID, err)
+	} else {
+		user.log.Debugfln("Marked %s as unread via com.famedly.marked_unread: %v", portal.MXID, err)
+	}
+}
+
 func (user *User) handleGroupCreate(evt *events.JoinedGroup) {
 	portal := user.GetPortalByJID(evt.JID)
 	if len(portal.MXID) == 0 {
-		err := portal.CreateMatrixRoom(user, &evt.GroupInfo, true)
+		err := portal.CreateMatrixRoom(user, &evt.GroupInfo, true, true)
 		if err != nil {
 			user.log.Errorln("Failed to create Matrix room after join notification: %v", err)
 		}
@@ -1016,4 +1202,36 @@ func (user *User) handlePictureUpdate(evt *events.Picture) {
 			portal.UpdateAvatar(user, evt.Author, true)
 		}
 	}
+}
+
+func (user *User) StartPM(jid types.JID, reason string) (*Portal, *Puppet, bool, error) {
+	user.log.Debugln("Starting PM with", jid, "from", reason)
+	puppet := user.bridge.GetPuppetByJID(jid)
+	puppet.SyncContact(user, true, false, reason)
+	portal := user.GetPortalByJID(puppet.JID)
+	if len(portal.MXID) > 0 {
+		ok := portal.ensureUserInvited(user)
+		if !ok {
+			portal.log.Warnfln("ensureUserInvited(%s) returned false, creating new portal", user.MXID)
+			portal.MXID = ""
+		} else {
+			return portal, puppet, false, nil
+		}
+	}
+	err := portal.CreateMatrixRoom(user, nil, false, true)
+	return portal, puppet, true, err
+}
+
+const groupListCacheMaxAge = 24 * time.Hour
+
+func (user *User) getCachedGroupList() ([]*types.GroupInfo, error) {
+	user.groupListCacheLock.Lock()
+	defer user.groupListCacheLock.Unlock()
+	if user.groupListCache != nil && user.groupListCacheTime.Add(groupListCacheMaxAge).After(time.Now()) {
+		return user.groupListCache, nil
+	}
+	var err error
+	user.groupListCache, err = user.Client.GetJoinedGroups()
+	user.groupListCacheTime = time.Now()
+	return user.groupListCache, err
 }

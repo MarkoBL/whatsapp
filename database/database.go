@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2019 Tulir Asokan
+// Copyright (C) 2022 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -17,15 +17,17 @@
 package database
 
 import (
-	"database/sql"
+	"errors"
+	"net"
+	"time"
 
 	"github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
-
-	log "maunium.net/go/maulogger/v2"
-
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+
 	"maunium.net/go/mautrix-whatsapp/database/upgrades"
+	"maunium.net/go/mautrix/util/dbutil"
 )
 
 func init() {
@@ -33,56 +35,83 @@ func init() {
 }
 
 type Database struct {
-	*sql.DB
-	log     log.Logger
-	dialect string
+	*dbutil.Database
 
-	User    *UserQuery
-	Portal  *PortalQuery
-	Puppet  *PuppetQuery
-	Message *MessageQuery
+	User     *UserQuery
+	Portal   *PortalQuery
+	Puppet   *PuppetQuery
+	Message  *MessageQuery
+	Reaction *ReactionQuery
 
-	DisappearingMessage *DisappearingMessageQuery
+	DisappearingMessage  *DisappearingMessageQuery
+	Backfill             *BackfillQuery
+	HistorySync          *HistorySyncQuery
+	MediaBackfillRequest *MediaBackfillRequestQuery
 }
 
-func New(dbType string, uri string, baseLog log.Logger) (*Database, error) {
-	conn, err := sql.Open(dbType, uri)
-	if err != nil {
-		return nil, err
-	}
-
-	db := &Database{
-		DB:      conn,
-		log:     baseLog.Sub("Database"),
-		dialect: dbType,
-	}
+func New(baseDB *dbutil.Database) *Database {
+	db := &Database{Database: baseDB}
+	db.UpgradeTable = upgrades.Table
 	db.User = &UserQuery{
 		db:  db,
-		log: db.log.Sub("User"),
+		log: db.Log.Sub("User"),
 	}
 	db.Portal = &PortalQuery{
 		db:  db,
-		log: db.log.Sub("Portal"),
+		log: db.Log.Sub("Portal"),
 	}
 	db.Puppet = &PuppetQuery{
 		db:  db,
-		log: db.log.Sub("Puppet"),
+		log: db.Log.Sub("Puppet"),
 	}
 	db.Message = &MessageQuery{
 		db:  db,
-		log: db.log.Sub("Message"),
+		log: db.Log.Sub("Message"),
+	}
+	db.Reaction = &ReactionQuery{
+		db:  db,
+		log: db.Log.Sub("Reaction"),
 	}
 	db.DisappearingMessage = &DisappearingMessageQuery{
 		db:  db,
-		log: db.log.Sub("DisappearingMessage"),
+		log: db.Log.Sub("DisappearingMessage"),
 	}
-	return db, nil
+	db.Backfill = &BackfillQuery{
+		db:  db,
+		log: db.Log.Sub("Backfill"),
+	}
+	db.HistorySync = &HistorySyncQuery{
+		db:  db,
+		log: db.Log.Sub("HistorySync"),
+	}
+	db.MediaBackfillRequest = &MediaBackfillRequestQuery{
+		db:  db,
+		log: db.Log.Sub("MediaBackfillRequest"),
+	}
+	return db
 }
 
-func (db *Database) Init() error {
-	return upgrades.Run(db.log.Sub("Upgrade"), db.dialect, db.DB)
+func isRetryableError(err error) bool {
+	if pqError := (&pq.Error{}); errors.As(err, &pqError) {
+		switch pqError.Code.Class() {
+		case "08", // Connection Exception
+			"53", // Insufficient Resources (e.g. too many connections)
+			"57": // Operator Intervention (e.g. server restart)
+			return true
+		}
+	} else if netError := (&net.OpError{}); errors.As(err, &netError) {
+		return true
+	}
+	return false
 }
 
-type Scannable interface {
-	Scan(...interface{}) error
+func (db *Database) HandleSignalStoreError(device *store.Device, action string, attemptIndex int, err error) (retry bool) {
+	if db.Dialect != dbutil.SQLite && isRetryableError(err) {
+		sleepTime := time.Duration(attemptIndex*2) * time.Second
+		device.Log.Warnf("Failed to %s (attempt #%d): %v - retrying in %v", action, attemptIndex+1, err, sleepTime)
+		time.Sleep(sleepTime)
+		return true
+	}
+	device.Log.Errorf("Failed to %s: %v", action, err)
+	return false
 }
